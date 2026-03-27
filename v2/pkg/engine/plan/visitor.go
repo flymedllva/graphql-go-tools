@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/buger/jsonparser"
 	"github.com/wundergraph/astjson"
 
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/ast"
@@ -675,7 +676,7 @@ func (v *Visitor) introspectionShouldEvaluateIncludeDeprecated(fieldName string,
 		introspectionEvaluateIncludeDeprecated = fieldName == "args"
 	case "__Type":
 		switch fieldName {
-		case "fields", "enumValues", "inputFields":
+		case "fields", "enumValues":
 			introspectionEvaluateIncludeDeprecated = true
 		}
 	}
@@ -683,22 +684,81 @@ func (v *Visitor) introspectionShouldEvaluateIncludeDeprecated(fieldName string,
 	return introspectionEvaluateIncludeDeprecated
 }
 
-func (v *Visitor) includeDeprecatedVariableName(fieldRef int) (name string) {
+type includeDeprecatedConfig struct {
+	variableName       string
+	operationValue     bool
+	hasOperationValue  bool
+	variableDefault    bool
+	hasVariableDefault bool
+	literal            bool
+	hasLiteral         bool
+}
+
+func (v *Visitor) resolveIncludeDeprecatedConfig(fieldRef int) (cfg includeDeprecatedConfig) {
 	if !v.Operation.FieldHasArguments(fieldRef) {
-		return
+		return cfg
 	}
 
 	argRef, ok := v.Operation.FieldArgument(fieldRef, []byte("includeDeprecated"))
 	if !ok {
-		return
+		return cfg
 	}
 
 	argValue := v.Operation.ArgumentValue(argRef)
-	if argValue.Kind != ast.ValueKindVariable {
-		return
+	switch argValue.Kind {
+	case ast.ValueKindBoolean:
+		cfg.hasLiteral = true
+		cfg.literal = bool(v.Operation.BooleanValue(argValue.Ref))
+	case ast.ValueKindVariable:
+		cfg.variableName = string(v.Operation.VariableValueNameBytes(argValue.Ref))
+		if len(v.Operation.Input.Variables) != 0 {
+			value, err := jsonparser.GetBoolean(v.Operation.Input.Variables, cfg.variableName)
+			if err == nil {
+				cfg.hasOperationValue = true
+				cfg.operationValue = value
+			}
+		}
+		variableDefinitionRef, exists := v.Operation.VariableDefinitionByNameAndOperation(v.operationDefinitionRef, v.Operation.VariableValueNameBytes(argValue.Ref))
+		if !exists || !v.Operation.VariableDefinitionHasDefaultValue(variableDefinitionRef) {
+			return cfg
+		}
+		defaultValue := v.Operation.VariableDefinitionDefaultValue(variableDefinitionRef)
+		if defaultValue.Kind != ast.ValueKindBoolean {
+			return cfg
+		}
+		cfg.hasVariableDefault = true
+		cfg.variableDefault = bool(v.Operation.BooleanValue(defaultValue.Ref))
 	}
 
-	return string(v.Operation.VariableValueNameBytes(argValue.Ref))
+	return cfg
+}
+
+func includeDeprecatedValueFromContext(ctx *resolve.Context, cfg includeDeprecatedConfig) bool {
+	if cfg.variableName != "" {
+		if ctx != nil && ctx.Variables != nil {
+			if value := ctx.Variables.Get(cfg.variableName); value != nil {
+				switch value.Type() {
+				case astjson.TypeTrue:
+					return true
+				case astjson.TypeFalse:
+					return false
+				}
+			}
+		}
+		if cfg.hasOperationValue {
+			return cfg.operationValue
+		}
+		if cfg.hasVariableDefault {
+			return cfg.variableDefault
+		}
+		return false
+	}
+
+	if cfg.hasLiteral {
+		return cfg.literal
+	}
+
+	return false
 }
 
 func (v *Visitor) resolveSkipArrayItem(fieldRef int, fieldName string, enclosingTypeName string) resolve.SkipArrayItem {
@@ -706,19 +766,15 @@ func (v *Visitor) resolveSkipArrayItem(fieldRef int, fieldName string, enclosing
 		return nil
 	}
 
-	return func(includeDeprecatedVariableName string) resolve.SkipArrayItem {
+	return func(cfg includeDeprecatedConfig) resolve.SkipArrayItem {
 		return func(ctx *resolve.Context, itemValue *astjson.Value) bool {
-			shouldIncludeDeprecated := false
-
-			if includeDeprecatedVariableName != "" {
-				shouldIncludeDeprecated = ctx.Variables.GetBool(includeDeprecatedVariableName)
-			}
+			shouldIncludeDeprecated := includeDeprecatedValueFromContext(ctx, cfg)
 
 			isDeprecated := itemValue.GetBool("isDeprecated")
 
 			return isDeprecated && !shouldIncludeDeprecated
 		}
-	}(v.includeDeprecatedVariableName(fieldRef))
+	}(v.resolveIncludeDeprecatedConfig(fieldRef))
 }
 
 func (v *Visitor) resolveFieldValue(fieldRef, typeRef int, nullable bool, path []string) resolve.Node {

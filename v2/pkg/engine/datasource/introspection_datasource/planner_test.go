@@ -1,12 +1,12 @@
 package introspection_datasource
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
-
 	"github.com/wundergraph/astjson"
-
+	"github.com/wundergraph/graphql-go-tools/v2/pkg/astnormalization"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/asttransform"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/datasourcetesting"
 	"github.com/wundergraph/graphql-go-tools/v2/pkg/engine/plan"
@@ -506,4 +506,166 @@ func TestIntrospectionDataSourcePlanning(t *testing.T) {
 			},
 		},
 	))
+}
+
+func TestIntrospectionIncludeDeprecatedExtractedLiteralTrue(t *testing.T) {
+	const testSchema = `
+		type Query {
+			active: String
+			legacy: String @deprecated(reason: "old")
+		}
+	`
+
+	const introspectionQuery = `
+		query IntrospectionQuery {
+			__type(name: "Query") {
+				fields(includeDeprecated: true) {
+					name
+				}
+			}
+		}
+	`
+
+	planned := buildIntrospectionPlan(t, testSchema, introspectionQuery, true)
+	skipItem := skipItemFromTypeField(t, planned, "fields")
+
+	deprecatedField := astjson.MustParseBytes([]byte(`{"name":"legacy","isDeprecated":true}`))
+
+	ctx := resolve.NewContext(context.Background())
+	ctx.Variables = astjson.MustParseBytes([]byte(`{}`))
+	// With ExtractVariables enabled, literal true is turned into an operation variable.
+	// We still must include deprecated fields even when runtime ctx.Variables is empty.
+	require.False(t, skipItem(ctx, deprecatedField))
+}
+
+func TestIntrospectionInputFieldsAreNotFilteredByIncludeDeprecated(t *testing.T) {
+	const testSchema = `
+		type Query {
+			friend(filter: TestAllFieldsDeprecatedFilterInput): String
+		}
+
+		input TestAllFieldsDeprecatedFilterInput {
+			foo: String @deprecated(reason: "old")
+		}
+	`
+
+	const introspectionQuery = `
+		query IntrospectionQuery {
+			__type(name: "TestAllFieldsDeprecatedFilterInput") {
+				inputFields {
+					name
+				}
+			}
+		}
+	`
+
+	planned := buildIntrospectionPlan(t, testSchema, introspectionQuery, false)
+	skipItem := skipItemFromTypeField(t, planned, "inputFields")
+	require.Nil(t, skipItem)
+}
+
+func TestIntrospectionInputFieldsMixedDeprecatedAreNotFilteredByIncludeDeprecated(t *testing.T) {
+	const testSchema = `
+		type Query {
+			friend(filter: TestAllFieldsDeprecatedFilterInput): String
+		}
+
+		input TestAllFieldsDeprecatedFilterInput {
+			foo: String @deprecated(reason: "old")
+			bar: String
+		}
+	`
+
+	const introspectionQuery = `
+		query IntrospectionQuery {
+			__type(name: "TestAllFieldsDeprecatedFilterInput") {
+				inputFields(includeDeprecated: false) {
+					name
+				}
+			}
+		}
+	`
+
+	planned := buildIntrospectionPlan(t, testSchema, introspectionQuery, false)
+	skipItem := skipItemFromTypeField(t, planned, "inputFields")
+	require.Nil(t, skipItem)
+}
+
+func buildIntrospectionPlan(t *testing.T, schema, introspectionQuery string, withExtractVariables bool) *plan.SynchronousResponsePlan {
+	t.Helper()
+
+	def := unsafeparser.ParseGraphqlDocumentString(schema)
+	err := asttransform.MergeDefinitionWithBaseSchema(&def)
+	require.NoError(t, err)
+
+	var (
+		introspectionData introspection.Data
+		report            operationreport.Report
+	)
+
+	gen := introspection.NewGenerator()
+	gen.Generate(&def, &report, &introspectionData)
+	require.False(t, report.HasErrors())
+
+	cfgFactory := IntrospectionConfigFactory{introspectionData: &introspectionData}
+	planConfiguration := plan.Configuration{
+		DataSources: introspectionDataSources(cfgFactory),
+		Fields:      cfgFactory.BuildFieldConfigurations(),
+	}
+
+	op := unsafeparser.ParseGraphqlDocumentString(introspectionQuery)
+	normalizationOptions := []astnormalization.Option{
+		astnormalization.WithInlineFragmentSpreads(),
+		astnormalization.WithRemoveFragmentDefinitions(),
+		astnormalization.WithRemoveUnusedVariables(),
+	}
+	if withExtractVariables {
+		normalizationOptions = append(normalizationOptions, astnormalization.WithExtractVariables())
+	}
+
+	norm := astnormalization.NewWithOpts(normalizationOptions...)
+	report = operationreport.Report{}
+	norm.NormalizeOperation(&op, &def, &report)
+	require.False(t, report.HasErrors(), report.Error())
+
+	planner, err := plan.NewPlanner(planConfiguration)
+	require.NoError(t, err)
+
+	actualPlan := planner.Plan(&op, &def, "", &report)
+	require.False(t, report.HasErrors(), report.Error())
+
+	syncPlan, ok := actualPlan.(*plan.SynchronousResponsePlan)
+	require.True(t, ok)
+	return syncPlan
+}
+
+func introspectionDataSources(cfgFactory IntrospectionConfigFactory) []plan.DataSource {
+	return cfgFactory.BuildDataSourceConfigurations()
+}
+
+func skipItemFromTypeField(t *testing.T, syncPlan *plan.SynchronousResponsePlan, fieldName string) resolve.SkipArrayItem {
+	t.Helper()
+
+	rootTypeField := findFieldByName(t, syncPlan.Response.Data, "__type")
+	typeObject, ok := rootTypeField.Value.(*resolve.Object)
+	require.True(t, ok)
+
+	introspectionField := findFieldByName(t, typeObject, fieldName)
+	arrayValue, ok := introspectionField.Value.(*resolve.Array)
+	require.True(t, ok)
+
+	return arrayValue.SkipItem
+}
+
+func findFieldByName(t *testing.T, object *resolve.Object, name string) *resolve.Field {
+	t.Helper()
+
+	for _, field := range object.Fields {
+		if string(field.Name) == name {
+			return field
+		}
+	}
+
+	require.FailNowf(t, "field not found", "field %q not found", name)
+	return nil
 }
