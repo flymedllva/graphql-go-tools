@@ -683,7 +683,20 @@ func (v *Visitor) introspectionShouldEvaluateIncludeDeprecated(fieldName string,
 	return introspectionEvaluateIncludeDeprecated
 }
 
-func (v *Visitor) includeDeprecatedVariableName(fieldRef int) (name string) {
+func (v *Visitor) introspectionIncludeDeprecatedByDefault(fieldName string, enclosingTypeName string) bool {
+	// Compatibility mode for legacy introspection queries (without inputValueDeprecation fields):
+	// return deprecated input values by default to avoid generating empty input object types.
+	switch enclosingTypeName {
+	case "__Directive", "__Field":
+		return fieldName == "args"
+	case "__Type":
+		return fieldName == "inputFields"
+	default:
+		return false
+	}
+}
+
+func (v *Visitor) includeDeprecatedArgument(fieldRef int) (literalValue bool, hasLiteralValue bool, variableName string) {
 	if !v.Operation.FieldHasArguments(fieldRef) {
 		return
 	}
@@ -694,11 +707,14 @@ func (v *Visitor) includeDeprecatedVariableName(fieldRef int) (name string) {
 	}
 
 	argValue := v.Operation.ArgumentValue(argRef)
-	if argValue.Kind != ast.ValueKindVariable {
+	switch argValue.Kind {
+	case ast.ValueKindBoolean:
+		return bool(v.Operation.BooleanValue(argValue.Ref)), true, ""
+	case ast.ValueKindVariable:
+		return false, false, string(v.Operation.VariableValueNameBytes(argValue.Ref))
+	default:
 		return
 	}
-
-	return string(v.Operation.VariableValueNameBytes(argValue.Ref))
 }
 
 func (v *Visitor) resolveSkipArrayItem(fieldRef int, fieldName string, enclosingTypeName string) resolve.SkipArrayItem {
@@ -706,9 +722,15 @@ func (v *Visitor) resolveSkipArrayItem(fieldRef int, fieldName string, enclosing
 		return nil
 	}
 
-	return func(includeDeprecatedVariableName string) resolve.SkipArrayItem {
+	literalValue, hasLiteralValue, includeDeprecatedVariableName := v.includeDeprecatedArgument(fieldRef)
+
+	return func(includeDeprecatedLiteralValue bool, hasIncludeDeprecatedLiteralValue bool, includeDeprecatedVariableName string) resolve.SkipArrayItem {
 		return func(ctx *resolve.Context, itemValue *astjson.Value) bool {
-			shouldIncludeDeprecated := false
+			shouldIncludeDeprecated := v.introspectionIncludeDeprecatedByDefault(fieldName, enclosingTypeName)
+
+			if hasIncludeDeprecatedLiteralValue {
+				shouldIncludeDeprecated = includeDeprecatedLiteralValue
+			}
 
 			if includeDeprecatedVariableName != "" {
 				shouldIncludeDeprecated = ctx.Variables.GetBool(includeDeprecatedVariableName)
@@ -718,7 +740,7 @@ func (v *Visitor) resolveSkipArrayItem(fieldRef int, fieldName string, enclosing
 
 			return isDeprecated && !shouldIncludeDeprecated
 		}
-	}(v.includeDeprecatedVariableName(fieldRef))
+	}(literalValue, hasLiteralValue, includeDeprecatedVariableName)
 }
 
 func (v *Visitor) resolveFieldValue(fieldRef, typeRef int, nullable bool, path []string) resolve.Node {
